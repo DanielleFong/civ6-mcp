@@ -482,7 +482,10 @@ def _launch_game_sync() -> str:
         log.info("Game process running but port not open yet, waiting...")
         if _wait_for_tuner_port():
             return "Game was starting up. FireTuner port is now open."
-        return "WARNING: Game process is running but FireTuner port never opened."
+        # Stale process — kill it and launch fresh
+        log.warning("Game process running but tuner never opened — killing stale process")
+        _kill_game_sync()
+        time.sleep(5)
 
     # Launch via Steam
     if sys.platform == "darwin":
