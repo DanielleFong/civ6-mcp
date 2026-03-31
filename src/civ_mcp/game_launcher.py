@@ -488,8 +488,10 @@ def _launch_game_sync() -> str:
     if sys.platform == "darwin":
         subprocess.run(["open", f"steam://run/{STEAM_APP_ID}"])
     elif sys.platform == "linux":
+        # Use -applaunch (not steam:// URI) — the URI scheme is unreliable
+        # when Steam is already running (silently ignored by some builds).
         subprocess.Popen(
-            ["steam", f"steam://run/{STEAM_APP_ID}"],
+            ["steam", "-applaunch", str(STEAM_APP_ID)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
