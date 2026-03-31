@@ -375,7 +375,38 @@ async def _logged(
             _result_summary(result),
         )
         await logger.log_error(tool_name, result)
+
+        # Connection-loss recovery: after consecutive failures,
+        # the game has likely crashed. Auto-restart from autosave.
+        _logged._conn_errors = getattr(_logged, "_conn_errors", 0) + 1
+        if _logged._conn_errors >= 5:
+            log.error(
+                "CONNECTION RECOVERY: %d consecutive connection failures "
+                "— triggering restart_and_load",
+                _logged._conn_errors,
+            )
+            _logged._conn_errors = 0
+            try:
+                turn_num = logger._turn
+                save = f"0_MCP_{int(turn_num):04d}" if turn_num else None
+                restart_result = await game_launcher.restart_and_load(save)
+                log.info("CONNECTION RECOVERY: %s", restart_result)
+                gs = _get_game(ctx)
+                for rc_attempt in range(30):
+                    try:
+                        await gs.conn.reconnect()
+                        if gs.conn.gamecore_index is not None:
+                            log.info("CONNECTION RECOVERY: reconnected")
+                            break
+                    except ConnectionError:
+                        pass
+                    await asyncio.sleep(1)
+            except Exception:
+                log.error("CONNECTION RECOVERY: restart failed", exc_info=True)
+
         return result
+    # Success — reset connection error counter
+    _logged._conn_errors = 0
     ms = int((time.monotonic() - start) * 1000)
     log.info(
         "[T%s] %s(%s) OK %dms: %s",
@@ -1894,25 +1925,39 @@ async def end_turn(
                         )
                         continue  # try the whole cycle again
 
-                    # Step 2b: Verify correct game loaded
+                    # Step 2b: Verify correct game loaded (with retries).
+                    # The game may still be on the leader screen after
+                    # restart — Lua states exist but game APIs aren't
+                    # fully initialized. Retry the check rather than
+                    # restarting the entire recovery cycle.
                     if identity_before is not None:
-                        try:
-                            actual = await gs.get_game_identity()
-                            if actual != identity_before:
-                                log.error(
-                                    "HANG RECOVERY: Wrong game loaded! "
-                                    "Expected %s, got %s — retrying",
-                                    identity_before,
+                        identity_ok = False
+                        for id_check in range(3):
+                            try:
+                                actual = await gs.get_game_identity()
+                                if actual == identity_before:
+                                    identity_ok = True
+                                    break
+                                log.warning(
+                                    "HANG RECOVERY: wrong identity %s vs %s "
+                                    "(check %d/3)",
                                     actual,
+                                    identity_before,
+                                    id_check + 1,
                                 )
-                                continue  # next attempt will kill+reload
-                        except Exception:
+                            except Exception:
+                                log.debug(
+                                    "HANG RECOVERY: identity check failed "
+                                    "(check %d/3), waiting...",
+                                    id_check + 1,
+                                )
+                            await asyncio.sleep(5)
+                        if not identity_ok:
                             log.warning(
-                                "HANG RECOVERY: identity check failed — "
-                                "retrying to be safe",
-                                exc_info=True,
+                                "HANG RECOVERY: identity check inconclusive "
+                                "— proceeding anyway (attempt %d)",
+                                attempt,
                             )
-                            continue
 
                     # Step 3: Reset state flags
                     gs._pending_end_turn = False
