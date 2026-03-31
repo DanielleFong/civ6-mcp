@@ -83,7 +83,7 @@ elif sys.platform == "win32":
     SAVE_DIR = os.path.join(_SAVE_BASE, "auto")
     SINGLE_SAVE_DIR = _SAVE_BASE
 elif sys.platform == "linux":
-    _PROCESS_NAMES = ("Civ6",)
+    _PROCESS_NAMES = ("Civ6", "Civ6Sub")
     _SAVE_BASE = os.path.expanduser(
         "~/.local/share/aspyr-media/Sid Meier's Civilization VI/Saves/Single"
     )
@@ -224,7 +224,11 @@ def _kill_game_sync() -> str:
         return "Game is not running."
 
     if sys.platform in ("darwin", "linux"):
-        subprocess.run(["pkill", "-9", "-f", "Civ6"], capture_output=True)
+        # Kill only the game binary — NOT Steam or other processes.
+        # Using -x (exact match) instead of -f (pattern) to avoid
+        # killing Steam when its command line contains "Civ6".
+        for proc_name in _PROCESS_NAMES:
+            subprocess.run(["pkill", "-9", "-x", proc_name], capture_output=True)
     elif sys.platform == "win32":
         for name in _PROCESS_NAMES:
             subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True)
