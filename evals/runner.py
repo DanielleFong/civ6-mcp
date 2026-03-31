@@ -136,6 +136,7 @@ _NEEDS_CHAT_COMPLETIONS = {"gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5"}
 VERTEX_MODELS = [
     "anthropic/vertex/claude-opus-4-6",
     "google/vertex/gemini-3.1-pro-preview",
+    "google/vertex/gemini-3.1-flash-lite-preview",
     "google/vertex/gemini-3-pro-preview",
     "google/vertex/gemini-3-flash-preview",
 ]
