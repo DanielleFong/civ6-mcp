@@ -278,35 +278,40 @@ class Machine:
 
     def kill_game(self) -> None:
         if self.os == "windows":
-            self.ssh("taskkill /F /IM CivilizationVI_DX12.exe 2>nul", timeout=10)
-            self.ssh("taskkill /F /IM CivilizationVI.exe 2>nul", timeout=10)
+            # PowerShell Stop-Process works cross-session (taskkill cannot
+            # reach Session 1 processes from SSH's Session 0)
+            ps = (
+                "Get-Process -ErrorAction SilentlyContinue "
+                "| Where-Object { $_.ProcessName -match 'CivilizationVI' } "
+                "| Stop-Process -Force -ErrorAction SilentlyContinue"
+            )
+            encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            self.ssh(f"powershell -EncodedCommand {encoded}", timeout=15)
         else:
             self.ssh("killall -9 Civ6Sub Civ6 2>/dev/null", timeout=10)
 
     def kill_runner(self) -> None:
-        # Try heartbeat PID first (most reliable across all platforms)
-        hb = self.read_heartbeat()
-        hb_pid = hb.get("pid") if hb else None
-        if hb_pid and str(hb_pid).isdigit():
-            if self.os == "windows":
-                self.ssh(f"taskkill /F /PID {hb_pid}", timeout=10)
-            else:
-                self.ssh(f"kill -9 {hb_pid} 2>/dev/null", timeout=10)
-
         if self.os == "windows":
-            # Fallback: find runner PID via PowerShell CommandLine match
+            # PowerShell Stop-Process works cross-session; taskkill cannot
+            # reach Session 1 from SSH's Session 0.
+            # Scope: runner/MCP python + civ-mcp only (not all python).
             ps = (
                 "Get-Process python -ErrorAction SilentlyContinue "
-                "| Where-Object { $_.CommandLine -match 'runner' } "
-                "| ForEach-Object { $_.Id }"
+                "| Where-Object { $_.CommandLine -match 'runner|civ.mcp' } "
+                "| Stop-Process -Force -ErrorAction SilentlyContinue; "
+                "Get-Process 'civ-mcp' -ErrorAction SilentlyContinue "
+                "| Stop-Process -Force -ErrorAction SilentlyContinue"
             )
             encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
-            rc, out = self.ssh(f"powershell -EncodedCommand {encoded}", timeout=15)
-            for pid in out.strip().split():
-                if pid.strip().isdigit():
-                    self.ssh(f"taskkill /F /PID {pid.strip()}", timeout=10)
+            self.ssh(f"powershell -EncodedCommand {encoded}", timeout=15)
             self.ssh("schtasks /End /TN CivBench 2>nul", timeout=10)
+            self.ssh("schtasks /Delete /TN CivBench /F 2>nul", timeout=10)
         else:
+            # Try heartbeat PID first
+            hb = self.read_heartbeat()
+            hb_pid = hb.get("pid") if hb else None
+            if hb_pid and str(hb_pid).isdigit():
+                self.ssh(f"kill -9 {hb_pid} 2>/dev/null", timeout=10)
             self.ssh(
                 "tmux kill-session -t civbench 2>/dev/null; pkill -f runner.py 2>/dev/null",
                 timeout=10,
@@ -819,15 +824,18 @@ def cmd_launch(
                 if not job.run_id and hb.get("run_id"):
                     job.run_id = hb["run_id"]
 
+                # Boot phases get 5 min (OCR/loading is slow); playing gets 90s
+                stale_threshold = 300 if phase != "playing" else 90
+
                 if phase in ("error", "finished"):
                     # Will be caught by completion sentinel check below
                     pass
-                elif age > 90:
-                    # Heartbeat stale — runner probably dead. Confirm.
+                elif age > stale_threshold:
+                    # Heartbeat stale — confirm with second read
                     time.sleep(5)
                     hb2 = m.read_heartbeat()
                     hb2_ts = hb2.get("ts", 0) if hb2 else 0
-                    if time.time() - hb2_ts > 90:
+                    if time.time() - hb2_ts > stale_threshold:
                         log.warning(
                             "Heartbeat stale: %s (phase=%s, T%d, age=%.0fs)",
                             jid,
