@@ -97,9 +97,7 @@ def estimate_eta(
     for i, ((seg_s, seg_e), r) in enumerate(zip(_ETA_SEGMENTS, pr)):
         n_obs = max(0, min(current_turn, seg_e) - seg_s)
         obs_rate = r * scale if n_obs > 0 else r
-        blended = (n_obs * obs_rate + _ETA_PSEUDOCOUNT * r) / (
-            n_obs + _ETA_PSEUDOCOUNT
-        )
+        blended = (n_obs * obs_rate + _ETA_PSEUDOCOUNT * r) / (n_obs + _ETA_PSEUDOCOUNT)
         rates.append(blended)
 
     # Point estimate
@@ -243,7 +241,7 @@ class Machine:
     def get_latest_turn(self) -> int | None:
         """Parse the last diary entry for turn number."""
         if self.os == "windows":
-            diary_dir = f"{self.repo}\\..\\.civ6-mcp"
+            diary_dir = "%USERPROFILE%\\.civ6-mcp"
             # Hacky but works — find newest diary, read last line
             cmd = (
                 f'powershell -Command "'
@@ -264,6 +262,20 @@ class Machine:
         except (ValueError, AttributeError):
             return None
 
+    def read_heartbeat(self) -> dict | None:
+        """Read heartbeat.json from remote machine. Returns parsed dict or None."""
+        if self.os == "windows":
+            cmd = "type %USERPROFILE%\\.civ6-mcp\\heartbeat.json 2>nul"
+        else:
+            cmd = "cat ~/.civ6-mcp/heartbeat.json 2>/dev/null"
+        rc, out = self.ssh(cmd, timeout=10)
+        if rc != 0 or not out.strip():
+            return None
+        try:
+            return json.loads(out.strip())
+        except json.JSONDecodeError:
+            return None
+
     def kill_game(self) -> None:
         if self.os == "windows":
             self.ssh("taskkill /F /IM CivilizationVI_DX12.exe 2>nul", timeout=10)
@@ -272,8 +284,27 @@ class Machine:
             self.ssh("killall -9 Civ6Sub Civ6 2>/dev/null", timeout=10)
 
     def kill_runner(self) -> None:
+        # Try heartbeat PID first (most reliable across all platforms)
+        hb = self.read_heartbeat()
+        hb_pid = hb.get("pid") if hb else None
+        if hb_pid and str(hb_pid).isdigit():
+            if self.os == "windows":
+                self.ssh(f"taskkill /F /PID {hb_pid}", timeout=10)
+            else:
+                self.ssh(f"kill -9 {hb_pid} 2>/dev/null", timeout=10)
+
         if self.os == "windows":
-            self.ssh("taskkill /F /IM python.exe 2>nul", timeout=10)
+            # Fallback: find runner PID via PowerShell CommandLine match
+            ps = (
+                "Get-Process python -ErrorAction SilentlyContinue "
+                "| Where-Object { $_.CommandLine -match 'runner' } "
+                "| ForEach-Object { $_.Id }"
+            )
+            encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            rc, out = self.ssh(f"powershell -EncodedCommand {encoded}", timeout=15)
+            for pid in out.strip().split():
+                if pid.strip().isdigit():
+                    self.ssh(f"taskkill /F /PID {pid.strip()}", timeout=10)
             self.ssh("schtasks /End /TN CivBench 2>nul", timeout=10)
         else:
             self.ssh(
@@ -282,17 +313,25 @@ class Machine:
             )
 
     def clean_autosaves(self) -> str:
+        """Remove MCP autosaves AND game autosaves to prevent wrong-save loads."""
         if self.os == "windows":
-            # Windows save path
             save_dir = "C:\\Users\\%USERNAME%\\Documents\\My Games\\Sid Meier's Civilization VI\\Saves\\Single"
-            rc, out = self.ssh(
-                f'del /Q "{save_dir}\\0_MCP_*.Civ6Save" 2>nul && echo CLEANED || echo NONE'
-            )
+            self.ssh(f'del /Q "{save_dir}\\0_MCP_*.Civ6Save" 2>nul')
+            # Also clean game autosaves that "Continue Game" would load
+            self.ssh(f'del /Q "{save_dir}\\auto\\AutoSave_*.Civ6Save" 2>nul')
+            rc, out = self.ssh("echo CLEANED")
         else:
-            save_dir = "~/.local/share/aspyr-media/Sid\\ Meier\\'s\\ Civilization\\ VI/Saves/Single"
-            rc, out = self.ssh(
-                f"rm -f {save_dir}/0_MCP_*.Civ6Save 2>/dev/null && echo CLEANED || echo NONE"
+            # Use Sid* glob to avoid apostrophe escaping issues through SSH
+            self.ssh(
+                "rm -f ~/.local/share/aspyr-media/Sid*/Saves/Single/0_MCP_*.Civ6Save "
+                "2>/dev/null"
             )
+            # Also clean game autosaves that "Continue Game" would load
+            self.ssh(
+                "rm -f ~/.local/share/aspyr-media/Sid*/Saves/Single/auto/AutoSave_*.Civ6Save "
+                "2>/dev/null"
+            )
+            rc, out = self.ssh("echo CLEANED")
         return out
 
     def launch_runner(self, model: str, scenario: str, runs: int = 1) -> bool:
@@ -419,6 +458,7 @@ class Job:
     synced: bool = False
     score: int = 0
     outcome: str = ""  # "victory", "defeat", ""
+    boot_phase: str = ""  # last known heartbeat phase
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -553,15 +593,28 @@ def cmd_status(machines: dict[str, Machine]) -> None:
             continue
         version = m.get_version()
         game = m.is_game_running()
-        runner = m.is_runner_running()
-        turn = m.get_latest_turn()
-        turn_str = f"T{turn}" if turn is not None else ""
-        print(
-            f"  {name:<12} {version:<20} "
-            f"{'CIV' if game else '   '} "
-            f"{'RUN' if runner else '   '} "
-            f"{turn_str}"
-        )
+        hb = m.read_heartbeat()
+        if hb:
+            hb_age = time.time() - hb.get("ts", 0)
+            phase = hb.get("phase", "?")
+            turn = hb.get("turn", 0)
+            alive = hb_age < 90
+            print(
+                f"  {name:<12} {version:<20} "
+                f"{'CIV' if game else '   '} "
+                f"{'HB' if alive else '  '} "
+                f"{phase:<10} T{turn}"
+            )
+        else:
+            runner = m.is_runner_running()
+            turn = m.get_latest_turn()
+            turn_str = f"T{turn}" if turn is not None else ""
+            print(
+                f"  {name:<12} {version:<20} "
+                f"{'CIV' if game else '   '} "
+                f"{'RUN' if runner else '   '} "
+                f"{'':10} {turn_str}"
+            )
 
     active_jobs = {
         k: v
@@ -700,6 +753,7 @@ def cmd_launch(
 
     # Track which machine is busy
     machine_jobs: dict[str, str | None] = {n: None for n in machine_names}
+    poll_count = 0
 
     while True:
         # Dispatch pending jobs to idle machines
@@ -744,52 +798,76 @@ def cmd_launch(
             machine_jobs[m_name] = jid
             log.info("Running: %s", jid)
 
-        # Poll active jobs
+        # Poll active jobs — heartbeat-first health detection
         for jid, job in jobs.items():
             if job.status != "running":
                 continue
 
             m = machines[job.machine_name]
-
-            # Check runner alive (grace period: 3 min after launch for game to start)
             launch_age = time.time() - job.started_at
-            if launch_age < 180:
-                continue  # too early to check — game still loading
-            if not m.is_runner_running():
-                # Runner died — confirm after short delay
-                time.sleep(5)
-                if not m.is_runner_running():
-                    if job.retries < max_retries:
-                        job.retries += 1
-                        job.status = "pending"  # will relaunch on next loop
-                        machine_jobs[job.machine_name] = None
-                        log.warning(
-                            "Runner died on %s, retry %d/%d",
-                            jid,
-                            job.retries,
-                            max_retries,
-                        )
-                        alert(f"Runner died: {jid} — retry {job.retries}/{max_retries}")
-                    else:
-                        job.status = "failed"
-                        job.fail_reason = "runner died after max retries"
-                        machine_jobs[job.machine_name] = None
-                        alert(
-                            f"Job failed: {jid} — runner died after {max_retries} retries"
-                        )
-                    continue
+            hb = m.read_heartbeat()
 
-            # Check turn progress
-            turn = m.get_latest_turn()
-            if turn is not None:
-                if turn != job.last_turn:
-                    job.last_turn = turn
-                    job.last_turn_change = time.time()
+            if hb is not None:
+                phase = hb.get("phase", "")
+                hb_turn = hb.get("turn", 0)
+                hb_ts = hb.get("ts", 0)
+                age = time.time() - hb_ts
+
+                job.boot_phase = phase
+
+                # Bind run_id from heartbeat if we don't have it yet
+                if not job.run_id and hb.get("run_id"):
+                    job.run_id = hb["run_id"]
+
+                if phase in ("error", "finished"):
+                    # Will be caught by completion sentinel check below
+                    pass
+                elif age > 90:
+                    # Heartbeat stale — runner probably dead. Confirm.
+                    time.sleep(5)
+                    hb2 = m.read_heartbeat()
+                    hb2_ts = hb2.get("ts", 0) if hb2 else 0
+                    if time.time() - hb2_ts > 90:
+                        log.warning(
+                            "Heartbeat stale: %s (phase=%s, T%d, age=%.0fs)",
+                            jid,
+                            phase,
+                            hb_turn,
+                            age,
+                        )
+                        if job.retries < max_retries:
+                            job.retries += 1
+                            job.status = "pending"
+                            machine_jobs[job.machine_name] = None
+                            alert(
+                                f"Runner died: {jid} (heartbeat stale, {phase}:T{hb_turn}) "
+                                f"— retry {job.retries}/{max_retries}"
+                            )
+                        else:
+                            job.status = "failed"
+                            job.fail_reason = (
+                                f"heartbeat stale (phase={phase}, T{hb_turn})"
+                            )
+                            machine_jobs[job.machine_name] = None
+                            alert(f"Job failed: {jid} — heartbeat stale")
+                        continue
                 else:
+                    # Heartbeat fresh — update turn
+                    if hb_turn > 0 and hb_turn != job.last_turn:
+                        old = job.last_turn
+                        job.last_turn = hb_turn
+                        job.last_turn_change = time.time()
+                        log.info("Turn advance: %s T%d->T%d", jid, old, hb_turn)
+
+                # Stall detection (using heartbeat turn)
+                if job.last_turn > 0:
                     stall_min = (time.time() - job.last_turn_change) / 60
                     if stall_min > stall_kill_min:
                         log.error(
-                            "Stall timeout: %s at T%d for %.0fm", jid, turn, stall_min
+                            "Stall timeout: %s at T%d for %.0fm",
+                            jid,
+                            job.last_turn,
+                            stall_min,
                         )
                         m.kill_runner()
                         m.kill_game()
@@ -798,24 +876,88 @@ def cmd_launch(
                             job.status = "pending"
                             machine_jobs[job.machine_name] = None
                             alert(
-                                f"Stall kill: {jid} T{turn} ({stall_min:.0f}m) — retry {job.retries}"
+                                f"Stall kill: {jid} T{job.last_turn} "
+                                f"({stall_min:.0f}m) — retry {job.retries}"
                             )
                         else:
                             job.status = "failed"
-                            job.fail_reason = f"stall at T{turn} for {stall_min:.0f}m"
+                            job.fail_reason = (
+                                f"stall at T{job.last_turn} for {stall_min:.0f}m"
+                            )
                             machine_jobs[job.machine_name] = None
                             alert(f"Job failed: {jid} — stall timeout")
                     elif stall_min > stall_alert_min:
-                        log.warning("Stall: %s at T%d for %.0fm", jid, turn, stall_min)
-            else:
-                # Turn polling failed — stall detection is blind
-                blind_min = (time.time() - job.last_turn_change) / 60
-                if blind_min > stall_alert_min:
-                    log.warning(
-                        "Cannot read turn for %s (%.0fm blind) — stall detection degraded",
+                        log.warning(
+                            "Stall: %s at T%d for %.0fm",
+                            jid,
+                            job.last_turn,
+                            stall_min,
+                        )
+                elif launch_age > 600:
+                    # Boot timeout: 10 min with heartbeat but never reached T>0
+                    log.error(
+                        "Boot timeout: %s stuck at phase=%s for %.0fm",
                         jid,
-                        blind_min,
+                        phase,
+                        launch_age / 60,
                     )
+                    m.kill_runner()
+                    m.kill_game()
+                    if job.retries < max_retries:
+                        job.retries += 1
+                        job.status = "pending"
+                        machine_jobs[job.machine_name] = None
+                        alert(f"Boot timeout: {jid} ({phase}) — retry {job.retries}")
+                    else:
+                        job.status = "failed"
+                        job.fail_reason = f"boot timeout (phase={phase})"
+                        machine_jobs[job.machine_name] = None
+                        alert(f"Job failed: {jid} — boot timeout")
+            else:
+                # No heartbeat — fall back to process detection + diary
+                if launch_age < 180:
+                    continue  # grace period
+                if not m.is_runner_running():
+                    time.sleep(5)
+                    if not m.is_runner_running():
+                        if job.retries < max_retries:
+                            job.retries += 1
+                            job.status = "pending"
+                            machine_jobs[job.machine_name] = None
+                            log.warning(
+                                "Runner died (no heartbeat): %s, retry %d/%d",
+                                jid,
+                                job.retries,
+                                max_retries,
+                            )
+                            alert(
+                                f"Runner died: {jid} — retry {job.retries}/{max_retries}"
+                            )
+                        else:
+                            job.status = "failed"
+                            job.fail_reason = "runner died after max retries"
+                            machine_jobs[job.machine_name] = None
+                            alert(f"Job failed: {jid} — runner died")
+                        continue
+
+                # Fall back to diary for turn
+                turn = m.get_latest_turn()
+                if turn is not None and turn != job.last_turn:
+                    old = job.last_turn
+                    job.last_turn = turn
+                    job.last_turn_change = time.time()
+                    log.info("Turn advance (diary): %s T%d->T%d", jid, old, turn)
+
+            # Boot tail: if stuck at T0 beyond grace, surface runner log
+            if (
+                job.last_turn == 0
+                and launch_age > 300
+                and poll_count % 5 == 0
+                and job.status == "running"
+            ):
+                tail = m.tail_log(3)
+                if tail:
+                    log.info("Boot tail %s: %s", jid, tail.replace("\n", " | ")[:200])
 
         # Check for completed jobs via sentinel file → run post-game pipeline
         # (skip during grace period — runner may not have started yet)
@@ -888,20 +1030,39 @@ def cmd_launch(
             alert(f"CivBench batch complete: {done_count} done, {fail_count} failed")
             break
 
-        # Print compact status line
+        # Print compact status line (with phase info)
         running = sum(1 for j in jobs.values() if j.status == "running")
         pending = sum(1 for j in jobs.values() if j.status == "pending")
         done = sum(1 for j in jobs.values() if j.status == "done")
         failed = sum(1 for j in jobs.values() if j.status == "failed")
         active_info = " | ".join(
-            f"{j.machine_name}:T{j.last_turn}"
+            f"{j.machine_name}:{j.boot_phase or '?'}:T{j.last_turn}"
             for j in jobs.values()
             if j.status == "running"
         )
         sys.stdout.write(
-            f"\r  [{done}✓ {running}▶ {pending}… {failed}✗] {active_info}    "
+            f"\r  [{done}ok {running}run {pending}wait {failed}fail] {active_info}    "
         )
         sys.stdout.flush()
+
+        # Periodic full status to log file (every ~5 min)
+        poll_count += 1
+        if poll_count % 10 == 0:
+            status_parts = []
+            for j in jobs.values():
+                if j.status == "running":
+                    elapsed_h = (time.time() - j.started_at) / 3600
+                    status_parts.append(
+                        f"{j.machine_name}:{j.boot_phase}:T{j.last_turn}:{elapsed_h:.1f}h"
+                    )
+            log.info(
+                "STATUS: [%d done %d run %d pend %d fail] %s",
+                done,
+                running,
+                pending,
+                failed,
+                " | ".join(status_parts),
+            )
 
         last_poll = time.time()
         time.sleep(poll_interval)

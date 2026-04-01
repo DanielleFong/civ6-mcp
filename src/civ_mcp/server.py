@@ -19,7 +19,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 
-from civ_mcp import game_launcher
+from civ_mcp import game_launcher, heartbeat
 from civ_mcp import narrate as nr
 from civ_mcp.connection import GameConnection, LuaError
 from civ_mcp.diary import (
@@ -89,6 +89,7 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
     # The step-5 verification below catches wrong-save scenarios as a
     # safety net (the Lua load path fails when mid-session, not from
     # main menu).
+    heartbeat.write("launching")
     log.info("Auto-boot: launching game...")
     result = await asyncio.to_thread(game_launcher._launch_game_sync)
     log.info("Auto-boot: launch result: %s", result)
@@ -98,6 +99,7 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
         try:
             await conn.connect()
             log.info("Auto-boot: connected to FireTuner")
+            heartbeat.write("connecting")
             break
         except ConnectionError:
             if attempt % 10 == 0:
@@ -105,12 +107,14 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
             await asyncio.sleep(1)
     else:
         log.error("Auto-boot: could not connect to FireTuner after 90s")
+        heartbeat.write("error")
         return
 
     # 3. Load save
     log.info("Auto-boot: loading save '%s'...", save_name)
     result = await load_game_save(conn, save_name)
     log.info("Auto-boot: load result: %s", result)
+    heartbeat.write("loading")
 
     # 4. Wait for save to load, click through leader intro, then reconnect.
     # The CONTINUE GAME button on the leader screen has low-contrast
@@ -138,6 +142,7 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
             await conn.reconnect()
             if conn.gamecore_index is not None:
                 log.info("Auto-boot: game ready (GameCore=%s)", conn.gamecore_index)
+                heartbeat.write("playing")  # turn unknown until first end_turn
                 game_ready = True
                 break
         except ConnectionError:
@@ -149,6 +154,7 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
         await asyncio.sleep(1)
     if not game_ready:
         log.warning("Auto-boot: save may not have loaded — GameCore not found")
+        heartbeat.write("error")
         return
 
     # 5. Verify correct save loaded. If the wrong save loaded (e.g.
@@ -175,9 +181,7 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
                     log.info("Auto-boot: Lua reload result: %s", result)
                     await asyncio.sleep(15)
                     # Click CONTINUE again for the leader screen
-                    await asyncio.to_thread(
-                        game_launcher._click_continue_positional
-                    )
+                    await asyncio.to_thread(game_launcher._click_continue_positional)
                     await asyncio.sleep(5)
                     for retry in range(30):
                         try:
@@ -225,10 +229,12 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
                                     log.warning("Auto-boot: all fallbacks failed")
                                     return
                                 log.info("Auto-boot: Lua reload verified at T%d", t2)
+                                heartbeat.write("playing", turn=t2)
                     except Exception:
                         log.debug("Auto-boot: post-reload verify failed", exc_info=True)
                     return
                 log.info("Auto-boot: verified save at T%d", turn)
+                heartbeat.write("playing", turn=turn)
     except Exception:
         log.debug("Auto-boot: save verification failed", exc_info=True)
 
@@ -247,6 +253,8 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     if alert_webhook:
         emitter.add_sink(AlertSink(alert_webhook))
     emitter.start()
+    heartbeat.init(emitter.run_id)
+    heartbeat.write("starting")
 
     logger = GameLogger(emitter)
     spatial = SpatialTracker(emitter)
@@ -449,6 +457,7 @@ async def get_game_overview(ctx: Context) -> str:
             civ, seed = await gs.get_game_identity()
             logger.bind_game(civ, seed)
             spatial.bind_game(civ, seed)
+            heartbeat.bind_game(civ, seed)
             gs.spatial = spatial
         except Exception:
             pass
@@ -2026,6 +2035,7 @@ async def end_turn(
             new_turn = int(m.group(1))
             _get_logger(ctx).set_turn(new_turn)
             _get_spatial(ctx).set_turn(new_turn)
+            heartbeat.write("playing", turn=new_turn)
         # Map capture — record terrain (first turn) + ownership delta
         if _diary_civ_type and _diary_seed:
             try:
@@ -2040,6 +2050,7 @@ async def end_turn(
 
     # Log structured game-over entry
     if "GAME OVER" in result:
+        heartbeat.write("finished", turn=_diary_turn or 0)
         try:
             gameover = await gs.check_game_over()
             if gameover is not None:
