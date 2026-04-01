@@ -387,7 +387,15 @@ def _click_continue_positional() -> None:
     _bring_to_front()
     time.sleep(0.3)
     for i, (abs_x, abs_y, pct_x, pct_y) in enumerate(coords, 1):
-        log.info("Grid click [%d/%d] at (%d,%d) [%.0f%%,%.0f%%]", i, len(coords), abs_x, abs_y, pct_x * 100, pct_y * 100)
+        log.info(
+            "Grid click [%d/%d] at (%d,%d) [%.0f%%,%.0f%%]",
+            i,
+            len(coords),
+            abs_x,
+            abs_y,
+            pct_x * 100,
+            pct_y * 100,
+        )
         _click(abs_x, abs_y)
         time.sleep(0.5)
 
@@ -487,7 +495,9 @@ def _launch_game_sync() -> str:
         if _wait_for_tuner_port():
             return "Game was starting up. FireTuner port is now open."
         # Stale process — kill it and launch fresh
-        log.warning("Game process running but tuner never opened — killing stale process")
+        log.warning(
+            "Game process running but tuner never opened — killing stale process"
+        )
         _kill_game_sync()
         time.sleep(5)
 
@@ -669,6 +679,36 @@ def _find_game_window_win32() -> WindowInfo | None:
     return results[0] if results else None
 
 
+def _get_frame_extents(wid: int) -> tuple[int, int, int, int]:
+    """Return (left, right, top, bottom) X11 frame extents for a window.
+
+    Queries ``_NET_FRAME_EXTENTS`` via xprop. Returns (0,0,0,0) if
+    unavailable (undecorated window, Wayland without XWayland, etc.).
+    """
+    try:
+        r = subprocess.run(
+            ["xprop", "-id", str(wid), "_NET_FRAME_EXTENTS"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # Output: _NET_FRAME_EXTENTS(CARDINAL) = left, right, top, bottom
+        if "=" in r.stdout:
+            vals = r.stdout.split("=")[1].strip().split(",")
+            if len(vals) >= 4:
+                extents = tuple(int(v.strip()) for v in vals[:4])
+                if extents[2] > 0:  # top > 0 means decorated
+                    log.info(
+                        "Frame extents: left=%d right=%d top=%d bottom=%d (wid=%d)",
+                        *extents,
+                        wid,
+                    )
+                return extents
+    except Exception:
+        pass
+    return (0, 0, 0, 0)
+
+
 def _find_game_window_linux() -> WindowInfo | None:
     """Find the Civ 6 window via xdotool on Linux.
 
@@ -724,12 +764,17 @@ def _find_game_window_linux() -> WindowInfo | None:
             )
             pid = int(r3.stdout.strip()) if r3.returncode == 0 else 0
 
+            # Compensate for GNOME window decorations (title bar).
+            # xdotool reports the decorated window bounds; we need the
+            # content area for accurate OCR→click coordinate mapping.
+            fl, fr, ft, fb = _get_frame_extents(wid)
+
             info = WindowInfo(
                 window_id=wid,
-                x=geo.get("X", 0),
-                y=geo.get("Y", 0),
-                w=geo.get("WIDTH", 0),
-                h=geo.get("HEIGHT", 0),
+                x=geo.get("X", 0) + fl,
+                y=geo.get("Y", 0) + ft,
+                w=geo.get("WIDTH", 0) - fl - fr,
+                h=geo.get("HEIGHT", 0) - ft - fb,
                 pid=pid,
             )
 
@@ -937,8 +982,11 @@ def _capture_window_linux(window_id: int) -> "PIL.Image.Image":
             if v.isdigit():
                 geo[k] = int(v)
 
-    x, y = geo.get("X", 0), geo.get("Y", 0)
-    w, h = geo.get("WIDTH", 0), geo.get("HEIGHT", 0)
+    # Compensate for GNOME window decorations (same as _find_game_window_linux)
+    fl, fr, ft, fb = _get_frame_extents(window_id)
+
+    x, y = geo.get("X", 0) + fl, geo.get("Y", 0) + ft
+    w, h = geo.get("WIDTH", 0) - fl - fr, geo.get("HEIGHT", 0) - ft - fb
     if w <= 0 or h <= 0:
         raise RuntimeError(f"Window {window_id} has no geometry ({w}x{h})")
 
@@ -1005,7 +1053,11 @@ def _ocr_vision(
             _last_rejected_ocr.append(entry)
             continue
         results.append(entry)
-    log.info("Vision OCR: %d lines found (%d rejected)", len(results), len(_last_rejected_ocr))
+    log.info(
+        "Vision OCR: %d lines found (%d rejected)",
+        len(results),
+        len(_last_rejected_ocr),
+    )
     if results:
         log.debug("Vision OCR sample: %s", [r[0] for r in results[:5]])
     return results
@@ -1289,7 +1341,9 @@ def _ocr_fullscreen() -> list[tuple[str, int, int, int, int]]:
     )
     if image is None:
         # macOS 15: CGWindowListCreateImage obsoleted — screencapture fallback
-        log.info("Fullscreen OCR: CGWindowListCreateImage returned nil, trying screencapture")
+        log.info(
+            "Fullscreen OCR: CGWindowListCreateImage returned nil, trying screencapture"
+        )
         image = _capture_fullscreen_screencapture()
         if image is None:
             return []
@@ -2102,7 +2156,13 @@ def _navigate_to_save_sync(save_name: str, tab: str | None = "Autosaves") -> str
         match = _find_text(results, "CONTINUE")
         if match:
             text, x, y, w, h = match
-            log.info("CONTINUE wait: found '%s' at (%d,%d) after %.0fs — clicking", text, x, y, elapsed)
+            log.info(
+                "CONTINUE wait: found '%s' at (%d,%d) after %.0fs — clicking",
+                text,
+                x,
+                y,
+                elapsed,
+            )
             _bring_to_front()
             _click(x, y)
             time.sleep(3)
@@ -2137,7 +2197,13 @@ def _navigate_to_save_sync(save_name: str, tab: str | None = "Autosaves") -> str
             _click_text("Load Game", timeout=10, post_delay=1, prefer_bottom=False)
             time.sleep(1)
             if _click_text(save_name, timeout=15, post_delay=0.5):
-                _click_text("Load Game", timeout=10, post_delay=1, prefer_bottom=True, min_y_fraction=0.7)
+                _click_text(
+                    "Load Game",
+                    timeout=10,
+                    post_delay=1,
+                    prefer_bottom=True,
+                    min_y_fraction=0.7,
+                )
                 time.sleep(15)
                 # One more attempt at CONTINUE
                 retry_match = _wait_for_text("CONTINUE", timeout=60, interval=2.5)
@@ -2149,7 +2215,9 @@ def _navigate_to_save_sync(save_name: str, tab: str | None = "Autosaves") -> str
                     time.sleep(3)
                     steps.append("Retry: clicked CONTINUE after re-navigation")
                 else:
-                    log.warning("Retry: CONTINUE still not found — using positional click")
+                    log.warning(
+                        "Retry: CONTINUE still not found — using positional click"
+                    )
                     _click_continue_positional()
                     time.sleep(3)
                     steps.append("Retry: CONTINUE not found — positional click")
@@ -2160,7 +2228,10 @@ def _navigate_to_save_sync(save_name: str, tab: str | None = "Autosaves") -> str
     elif not continue_found:
         # OCR timeout — neither CONTINUE nor main menu detected.
         # Use positional click grid as last resort.
-        log.warning("OCR: CONTINUE not found after %ds — using positional click grid", poll_timeout)
+        log.warning(
+            "OCR: CONTINUE not found after %ds — using positional click grid",
+            poll_timeout,
+        )
         _click_continue_positional()
         time.sleep(3)
         steps.append("CONTINUE not found via OCR — used positional click fallback")
