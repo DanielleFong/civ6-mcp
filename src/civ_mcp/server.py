@@ -148,9 +148,11 @@ async def _auto_boot(conn: GameConnection, save_name: str) -> None:
         except ConnectionError:
             pass
         # Retry positional click every 10s in case the first click missed
-        if attempt > 0 and attempt % 10 == 0 and not clicked:
-            log.info("Auto-boot: retrying positional click (attempt %d)", attempt)
-            await asyncio.to_thread(game_launcher._click_continue_positional)
+        if attempt > 0 and attempt % 10 == 0:
+            heartbeat.write("loading")  # keep heartbeat fresh during retry
+            if not clicked:
+                log.info("Auto-boot: retrying positional click (attempt %d)", attempt)
+                await asyncio.to_thread(game_launcher._click_continue_positional)
         await asyncio.sleep(1)
     if not game_ready:
         log.warning("Auto-boot: save may not have loaded — GameCore not found")
