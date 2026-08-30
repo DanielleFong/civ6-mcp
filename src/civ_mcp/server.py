@@ -312,6 +312,13 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     heartbeat.write("starting")
 
     logger = GameLogger(emitter)
+
+    # Performance instrumentation — APM, blocked time, per-turn stats
+    from civ_mcp.perf import PerfTracker, instrument_tools
+
+    perf = PerfTracker(emitter)
+    instrument_tools(server, perf)
+
     spatial = SpatialTracker(emitter)
     map_capture = MapCapture(emitter)
     gs = GameState(conn)
