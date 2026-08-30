@@ -228,7 +228,7 @@ def _win32_civ6_pids() -> list[int]:
     try:
         out = _sp.run(
             ["powershell", "-NoProfile", "-Command",
-             "Get-Process | Where-Object {$_.ProcessName -like 'CivilizationVI*'} | "
+             "Get-Process | Where-Object {$_.ProcessName -in @('CivilizationVI_DX12','CivilizationVI')} | "
              "Sort-Object StartTime | Select-Object -ExpandProperty Id"],
             capture_output=True, text=True, timeout=15,
         ).stdout
@@ -256,14 +256,21 @@ def _kill_game_sync() -> str:
         if len(pids) > 1 and not os.environ.get("CIV_MCP_KILL_ALL"):
             target = _LAUNCHED_PID[0] if _LAUNCHED_PID and _LAUNCHED_PID[0] in pids else None
             if target is None:
-                # Unknown owner: kill the OLDEST instance (ours was launched
-                # first in the agent-first protocol) rather than all.
-                target = pids[0]
+                # Unknown owner: REFUSE to kill. Guessing killed a human's
+                # game. The tuner connection can be re-established without
+                # killing; a human can close windows manually if truly needed.
+                log.warning(
+                    "Multiple Civ 6 instances (%s) and MCP-owned PID unknown — "
+                    "refusing to kill. Set CIV_MCP_KILL_ALL=1 to override.", pids,
+                )
+                return (
+                    "REFUSED: multiple Civ 6 instances running and I don't know "
+                    "which is mine. Not killing anything (a human may be playing). "
+                    "Try reconnecting to the tuner instead; ask the human to close "
+                    "extra instances if a restart is truly required."
+                )
             subprocess.run(["taskkill", "/PID", str(target), "/F"], capture_output=True)
-            log.warning(
-                "Multiple Civ 6 instances (%s); killed only pid %s. "
-                "Set CIV_MCP_KILL_ALL=1 to kill all.", pids, target,
-            )
+            log.warning("Multiple Civ 6 instances (%s); killed only our pid %s.", pids, target)
         else:
             for name in _PROCESS_NAMES:
                 subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True)
