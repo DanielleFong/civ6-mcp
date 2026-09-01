@@ -2907,6 +2907,72 @@ async def _narrate(
     return narrate_fn(data)
 
 
+
+@mcp.tool()
+async def execute_plan(ctx: Context, plan: str) -> str:
+    """Execute an ordered batch of actions in ONE call — the speed tool (LIG-982).
+
+    plan: JSON array of action objects, executed serially, stopping at the
+    first failure. Each object has "op" plus that op's arguments:
+
+      {"op": "unit_action", "unit_id": 123, "action": "move", "target_x": 5, "target_y": 7}
+      {"op": "set_city_production", "city_id": 65536, "item_type": "UNIT", "item_name": "UNIT_SETTLER"}
+      {"op": "set_research", "tech_or_civic": "TECH_MINING", "category": "tech"}
+      {"op": "end_turn", "tactical": "...", "strategic": "...", "tooling": "...", "planning": "...", "hypothesis": "..."}
+
+    Rules: end_turn may only appear LAST. Max 30 actions. Returns one compact
+    line per action (index, op, result head) plus the full end_turn report if
+    reached. On failure: stops, marks remaining actions SKIPPED — re-plan from
+    the failure, do not blindly resubmit.
+
+    Use this for routine turns: plan the whole turn in one thought, submit one
+    call. Fall back to individual tools for exploratory/decision-heavy moments.
+    """
+    import json as _json
+
+    _OPS = {
+        "unit_action": unit_action,
+        "set_city_production": set_city_production,
+        "set_research": set_research,
+        "end_turn": end_turn,
+    }
+    try:
+        actions = _json.loads(plan)
+        assert isinstance(actions, list) and actions, "plan must be a non-empty JSON array"
+        assert len(actions) <= 30, "max 30 actions per plan"
+    except Exception as e:
+        return f"PLAN PARSE ERROR: {e}"
+
+    lines: list[str] = []
+    for i, a in enumerate(actions):
+        op = a.get("op")
+        fn = _OPS.get(op)
+        if fn is None:
+            lines.append(f"[{i}] {op}: UNSUPPORTED (allowed: {', '.join(_OPS)})")
+            lines.extend(f"[{j}] {b.get('op')}: SKIPPED" for j, b in enumerate(actions[i+1:], i+1))
+            break
+        if op == "end_turn" and i != len(actions) - 1:
+            lines.append(f"[{i}] end_turn: REJECTED — must be the last action")
+            lines.extend(f"[{j}] {b.get('op')}: SKIPPED" for j, b in enumerate(actions[i+1:], i+1))
+            break
+        kwargs = {k: v for k, v in a.items() if k != "op"}
+        try:
+            result = await fn(ctx, **kwargs)
+        except Exception as e:
+            result = f"ERROR: {e}"
+        head = str(result).split("\n")[0][:160]
+        failed = str(result).startswith(("Error", "ERR", "ERROR", "Cannot", "FAILED", "PLAN"))
+        if op == "end_turn":
+            lines.append(f"[{i}] end_turn:")
+            lines.append(str(result))
+        else:
+            lines.append(f"[{i}] {op}: {head}")
+        if failed:
+            lines.extend(f"[{j}] {b.get('op')}: SKIPPED" for j, b in enumerate(actions[i+1:], i+1))
+            break
+    return "\n".join(lines)
+
+
 def main():
     """Entry point for the MCP server."""
     import signal
