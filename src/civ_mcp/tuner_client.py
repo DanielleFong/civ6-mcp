@@ -25,7 +25,7 @@ TAG_HELP = 1
 
 # Default connection
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 4318
+DEFAULT_PORT = int(__import__("os").environ.get("CIV_MCP_TUNER_PORT", "4318"))
 
 
 @dataclass

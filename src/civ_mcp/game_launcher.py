@@ -218,6 +218,25 @@ def _dismiss_crash_dialog() -> bool:
         return False
 
 
+# PID of the instance this MCP server launched (agent-owned instance).
+_LAUNCHED_PID: list[int] = []
+
+
+def _win32_civ6_pids() -> list[int]:
+    """Return PIDs of running Civ 6 instances, oldest first (creation order)."""
+    import subprocess as _sp
+    try:
+        out = _sp.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process | Where-Object {$_.ProcessName -in @('CivilizationVI_DX12','CivilizationVI')} | "
+             "Sort-Object StartTime | Select-Object -ExpandProperty Id"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
 def _kill_game_sync() -> str:
     """Kill Civ 6 and wait for Steam to deregister. Blocking."""
     if not is_game_running():
@@ -230,8 +249,31 @@ def _kill_game_sync() -> str:
         for proc_name in _PROCESS_NAMES:
             subprocess.run(["pkill", "-9", "-x", proc_name], capture_output=True)
     elif sys.platform == "win32":
-        for name in _PROCESS_NAMES:
-            subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True)
+        # Kill only the MCP-owned instance when multiple are running.
+        # A human may be playing a second instance on this machine
+        # (direct-exe launch) — taskkill /IM would murder their game too.
+        pids = _win32_civ6_pids()
+        if len(pids) > 1 and not os.environ.get("CIV_MCP_KILL_ALL"):
+            target = _LAUNCHED_PID[0] if _LAUNCHED_PID and _LAUNCHED_PID[0] in pids else None
+            if target is None:
+                # Unknown owner: REFUSE to kill. Guessing killed a human's
+                # game. The tuner connection can be re-established without
+                # killing; a human can close windows manually if truly needed.
+                log.warning(
+                    "Multiple Civ 6 instances (%s) and MCP-owned PID unknown — "
+                    "refusing to kill. Set CIV_MCP_KILL_ALL=1 to override.", pids,
+                )
+                return (
+                    "REFUSED: multiple Civ 6 instances running and I don't know "
+                    "which is mine. Not killing anything (a human may be playing). "
+                    "Try reconnecting to the tuner instead; ask the human to close "
+                    "extra instances if a restart is truly required."
+                )
+            subprocess.run(["taskkill", "/PID", str(target), "/F"], capture_output=True)
+            log.warning("Multiple Civ 6 instances (%s); killed only our pid %s.", pids, target)
+        else:
+            for name in _PROCESS_NAMES:
+                subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True)
     else:
         raise NotImplementedError(f"kill not supported on {sys.platform}")
     log.info("Killed Civ 6, waiting %ds for Steam to deregister", _KILL_SETTLE_SECONDS)
@@ -564,6 +606,12 @@ def _launch_game_sync() -> str:
 
     if waited is None:
         return "WARNING: Game process not detected after launch. Check Steam."
+
+    # Remember which instance is ours so kill_game spares human instances
+    if sys.platform == "win32":
+        pids = _win32_civ6_pids()
+        if pids:
+            _LAUNCHED_PID[:] = [pids[-1]]  # newest = the one we just launched
 
     # Wait for FireTuner port to open (replaces blind sleep)
     log.info("Game process started after %ds, waiting for FireTuner port...", waited)

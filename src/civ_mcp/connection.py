@@ -26,7 +26,10 @@ class LuaError(Exception):
 class GameConnection:
     """Persistent FireTuner TCP connection to Civ 6."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 4318):
+    def __init__(self, host: str | None = None, port: int | None = None):
+        from civ_mcp.tuner_client import DEFAULT_HOST, DEFAULT_PORT
+        host = host or DEFAULT_HOST
+        port = port or DEFAULT_PORT
         self.host = host
         self.port = port
         self._reader: asyncio.StreamReader | None = None
@@ -41,6 +44,70 @@ class GameConnection:
         return self._writer is not None and not self._writer.is_closing()
 
     async def connect(self) -> None:
+        """Connect to Civ 6, honoring CIV_MCP_EXPECTED_GAME if set.
+
+        When CIV_MCP_EXPECTED_GAME is set (substring matched, case-insensitive,
+        against the loaded game's civ + leader name), scan candidate tuner
+        ports and attach ONLY to the instance running that game.  This makes
+        concurrent games on one machine safe: the server binds to a *game*,
+        not a port.  (LIG-987)
+        """
+        import os as _os
+
+        expected = _os.environ.get("CIV_MCP_EXPECTED_GAME", "").strip().lower()
+        if expected:
+            await self._connect_to_expected_game(expected)
+            return
+        await self._connect_once()
+
+    async def _identity_probe(self) -> str:
+        """Return a civ/leader identity string for the loaded game, or ''."""
+        if self.ingame_index is None:
+            return ""
+        try:
+            rows = await self.execute_in_state(
+                self.ingame_index,
+                "local me=Game.GetLocalPlayer() "
+                "local cfg=PlayerConfigurations[me] "
+                "print(cfg:GetCivilizationTypeName()..'|'..cfg:GetLeaderTypeName())",
+                timeout=5.0,
+            )
+            return " ".join(rows).lower()
+        except Exception:
+            return ""
+
+    async def _connect_to_expected_game(self, expected: str) -> None:
+        """Scan candidate ports; attach only where the expected game is loaded."""
+        base = self.port
+        candidates = [base] + [p for p in range(4318, 4331) if p != base]
+        tried: list[str] = []
+        for port in candidates:
+            self.port = port
+            try:
+                await self._connect_once()
+            except ConnectionError:
+                tried.append(f"{port}: no tuner")
+                continue
+            identity = await self._identity_probe()
+            # A menu-stage instance (no game loaded) is safe to claim — the
+            # gate exists to avoid attaching to the WRONG game, not to block
+            # bootstrap (load_game_save needs a connection first).
+            if expected in identity or not identity:
+                log.info(
+                    "Game-identity match on port %d: %r contains %r",
+                    port, identity, expected,
+                )
+                return
+            tried.append(f"{port}: {identity or 'no game loaded'}")
+            await self.disconnect()
+        self.port = base
+        raise ConnectionError(
+            f"CIV_MCP_EXPECTED_GAME={expected!r} not found on any tuner port. "
+            f"Scanned: {'; '.join(tried) or 'nothing listening'}. "
+            "Load the expected game in an instance and retry."
+        )
+
+    async def _connect_once(self) -> None:
         """Connect to Civ 6 and discover Lua state indexes."""
         log.info("Connecting to Civ 6 at %s:%d", self.host, self.port)
         try:

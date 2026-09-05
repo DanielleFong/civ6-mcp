@@ -53,6 +53,8 @@ _NONCRITICAL_POPUPS = [
     "RockBandPopup",
     "RockBandMoviePopup",
     "NaturalDisasterPopup",
+    "HeroesPopup",  # Heroes & Legends: hero discovered cinematic (choice-free)
+    "SecretSocietyPopup",  # Secret Societies: discovery cinematic (join is a separate governor action)
 ]
 
 # Critical screens — pause both camera and popup watcher while visible.
