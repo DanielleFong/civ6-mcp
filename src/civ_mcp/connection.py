@@ -60,8 +60,14 @@ class GameConnection:
             return
         await self._connect_once()
 
-    async def _identity_probe(self) -> str:
-        """Return a civ/leader identity string for the loaded game, or ''."""
+    async def _identity_probe(self) -> str | None:
+        """Civ/leader identity of the loaded game.
+
+        Returns '' when the instance is at the menu (no InGame Lua state — nothing
+        loaded, safe to claim for bootstrap) and None when a game IS loaded but the
+        probe failed (timeout, Lua error). None must never be treated as a match:
+        during a slow AI turn the probe can time out on the WRONG game.
+        """
         if self.ingame_index is None:
             return ""
         try:
@@ -74,7 +80,7 @@ class GameConnection:
             )
             return " ".join(rows).lower()
         except Exception:
-            return ""
+            return None
 
     async def _connect_to_expected_game(self, expected: str) -> None:
         """Scan candidate ports; attach only where the expected game is loaded."""
@@ -92,13 +98,13 @@ class GameConnection:
             # A menu-stage instance (no game loaded) is safe to claim — the
             # gate exists to avoid attaching to the WRONG game, not to block
             # bootstrap (load_game_save needs a connection first).
-            if expected in identity or not identity:
+            if identity is not None and (expected in identity or identity == ""):
                 log.info(
-                    "Game-identity match on port %d: %r contains %r",
-                    port, identity, expected,
+                    "Game-identity %s on port %d: %r (expected %r)",
+                    "match" if identity else "menu-stage claim", port, identity, expected,
                 )
                 return
-            tried.append(f"{port}: {identity or 'no game loaded'}")
+            tried.append(f"{port}: {'probe failed' if identity is None else identity}")
             await self.disconnect()
         self.port = base
         raise ConnectionError(
