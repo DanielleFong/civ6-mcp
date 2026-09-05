@@ -89,7 +89,10 @@ class GameConnection:
                 tried.append(f"{port}: no tuner")
                 continue
             identity = await self._identity_probe()
-            if expected in identity:
+            # A menu-stage instance (no game loaded) is safe to claim — the
+            # gate exists to avoid attaching to the WRONG game, not to block
+            # bootstrap (load_game_save needs a connection first).
+            if expected in identity or not identity:
                 log.info(
                     "Game-identity match on port %d: %r contains %r",
                     port, identity, expected,
